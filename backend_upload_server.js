@@ -228,6 +228,24 @@ app.get("/api/media", async (_req, res) => {
   }
 });
 
+app.get("/api/debug-db", async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        current_database() AS db_name,
+        current_user AS db_user,
+        now() AS server_time
+    `);
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to check database",
+      error: error.message
+    });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
