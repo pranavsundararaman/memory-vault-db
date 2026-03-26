@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const crypto = require("crypto");
-const fs = require("fs");
 const path = require("path");
 const { promisify } = require("util");
 const { execFile } = require("child_process");
@@ -10,13 +9,17 @@ const exifr = require("exifr");
 const sharp = require("sharp");
 const ffprobe = require("ffprobe-static");
 const { Pool } = require("pg");
+const cloudinary = require("cloudinary").v2;
 
 const execFileAsync = promisify(execFile);
 const app = express();
 const port = process.env.PORT || 3000;
 
-const uploadDir = path.join(__dirname, "uploads");
-fs.mkdirSync(uploadDir, { recursive: true });
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -25,20 +28,29 @@ const pool = new Pool({
 
 app.use(cors());
 app.use(express.json());
-app.use("/uploads", express.static(uploadDir));
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const safeName = `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`;
-    cb(null, safeName);
-  },
-});
-
-const upload = multer({ storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/api/debug-db", async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        current_database() AS db_name,
+        current_user AS db_user,
+        now() AS server_time
+    `);
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to check database",
+      error: error.message,
+    });
+  }
 });
 
 app.post("/api/media/upload", upload.single("file"), async (req, res) => {
@@ -49,15 +61,15 @@ app.post("/api/media/upload", upload.single("file"), async (req, res) => {
       return res.status(400).json({ message: "File is required" });
     }
 
-    const fileBuffer = fs.readFileSync(req.file.path);
-    const checksumSha256 = crypto.createHash("sha256").update(fileBuffer).digest("hex");
+    const checksumSha256 = crypto
+      .createHash("sha256")
+      .update(req.file.buffer)
+      .digest("hex");
+
     const mimeType = req.file.mimetype || "application/octet-stream";
     const mediaType = mimeType.startsWith("image/") ? "photo" : "video";
-    const relativeFilePath = `/uploads/${path.basename(req.file.path)}`;
-
-    const extracted = await extractMetadata(req.file.path, mediaType);
+    const extracted = await extractMetadata(req.file.buffer, mediaType);
     const captureTs = extracted.captureTs || null;
-    const isFavourite = false;
 
     await client.query("BEGIN");
 
@@ -73,13 +85,13 @@ app.post("/api/media/upload", upload.single("file"), async (req, res) => {
 
     if (duplicateCheck.rowCount > 0) {
       await client.query("ROLLBACK");
-      removeLocalFile(req.file.path);
       return res.status(409).json({
         message: "Duplicate file detected",
         duplicate: duplicateCheck.rows[0],
       });
     }
 
+    const uploadedAsset = await uploadToCloudinary(req.file, mediaType);
     const deviceId = await ensureDevice(client, extracted.device);
     const locationId = await ensureLocation(client, extracted.location);
 
@@ -104,13 +116,13 @@ app.post("/api/media/upload", upload.single("file"), async (req, res) => {
         deviceId,
         locationId,
         req.file.originalname,
-        relativeFilePath,
+        uploadedAsset.secure_url,
         req.file.size,
         mimeType,
         mediaType,
         captureTs,
         checksumSha256,
-        isFavourite,
+        false,
       ]
     );
 
@@ -195,7 +207,6 @@ app.post("/api/media/upload", upload.single("file"), async (req, res) => {
     });
   } catch (error) {
     await client.query("ROLLBACK");
-    removeLocalFile(req.file?.path);
     console.error(error);
     return res.status(500).json({
       message: "Upload failed",
@@ -218,7 +229,7 @@ app.get("/api/media", async (_req, res) => {
         is_favourite,
         ingested_at
       FROM media_items
-      WHERE file_path LIKE '/uploads/%'
+      WHERE file_path LIKE 'https://res.cloudinary.com/%'
       ORDER BY ingested_at DESC
     `);
 
@@ -226,26 +237,7 @@ app.get("/api/media", async (_req, res) => {
   } catch (error) {
     res.status(500).json({
       message: "Failed to fetch media",
-      error: error.message
-    });
-  }
-});
-
-
-app.get("/api/debug-db", async (_req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        current_database() AS db_name,
-        current_user AS db_user,
-        now() AS server_time
-    `);
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({
-      message: "Failed to check database",
-      error: error.message
+      error: error.message,
     });
   }
 });
@@ -254,25 +246,48 @@ app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
 
-async function extractMetadata(filePath, mediaType) {
-  if (mediaType === "photo") {
-    return extractPhotoMetadata(filePath);
-  }
-  return extractVideoMetadata(filePath);
+async function uploadToCloudinary(file, mediaType) {
+  const resourceType = mediaType === "video" ? "video" : "image";
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: "memory-vault",
+        resource_type: resourceType,
+        public_id: buildPublicId(file.originalname),
+      },
+      (error, result) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(result);
+      }
+    );
+
+    uploadStream.end(file.buffer);
+  });
 }
 
-async function extractPhotoMetadata(filePath) {
-  const exif = (await exifr.parse(filePath, {
+async function extractMetadata(fileBuffer, mediaType) {
+  if (mediaType === "photo") {
+    return extractPhotoMetadata(fileBuffer);
+  }
+  return extractVideoMetadata(fileBuffer);
+}
+
+async function extractPhotoMetadata(fileBuffer) {
+  const exif = (await exifr.parse(fileBuffer, {
     gps: true,
     tiff: true,
     exif: true,
     ifd0: true,
   })) || {};
 
-  const image = await sharp(filePath).metadata();
+  const image = await sharp(fileBuffer).metadata();
 
   return {
-    captureTs: toIsoString(exif.DateTimeOriginal || exif.CreateDate || image.exif?.CreateDate),
+    captureTs: toIsoString(exif.DateTimeOriginal || exif.CreateDate),
     device: {
       make: cleanText(exif.Make),
       model: cleanText(exif.Model),
@@ -292,32 +307,41 @@ async function extractPhotoMetadata(filePath) {
   };
 }
 
-async function extractVideoMetadata(filePath) {
-  const probe = await getFfprobeMetadata(filePath);
-  const videoStream = probe.streams.find((stream) => stream.codec_type === "video") || {};
-  const audioStream = probe.streams.find((stream) => stream.codec_type === "audio") || {};
+async function extractVideoMetadata(fileBuffer) {
+  const tempFilePath = path.join(__dirname, `temp-${Date.now()}.mp4`);
 
-  return {
-    captureTs: toIsoString(
-      probe.format?.tags?.creation_time ||
-      videoStream.tags?.creation_time
-    ),
-    device: {
-      make: null,
-      model: cleanText(probe.format?.tags?.encoder),
-    },
-    location: null,
-    photo: emptyPhotoMetadata(),
-    video: {
-      durationSeconds: toNumberOrNull(probe.format?.duration),
-      fps: parseFps(videoStream.avg_frame_rate || videoStream.r_frame_rate),
-      codec: cleanText(videoStream.codec_name),
-      bitrateKbps: toKbps(probe.format?.bit_rate),
-      audioChannels: toNumberOrNull(audioStream.channels),
-      width: toNumberOrNull(videoStream.width),
-      height: toNumberOrNull(videoStream.height),
-    },
-  };
+  try {
+    require("fs").writeFileSync(tempFilePath, fileBuffer);
+    const probe = await getFfprobeMetadata(tempFilePath);
+    const videoStream = probe.streams.find((stream) => stream.codec_type === "video") || {};
+    const audioStream = probe.streams.find((stream) => stream.codec_type === "audio") || {};
+
+    return {
+      captureTs: toIsoString(
+        probe.format?.tags?.creation_time ||
+        videoStream.tags?.creation_time
+      ),
+      device: {
+        make: null,
+        model: cleanText(probe.format?.tags?.encoder),
+      },
+      location: null,
+      photo: emptyPhotoMetadata(),
+      video: {
+        durationSeconds: toNumberOrNull(probe.format?.duration),
+        fps: parseFps(videoStream.avg_frame_rate || videoStream.r_frame_rate),
+        codec: cleanText(videoStream.codec_name),
+        bitrateKbps: toKbps(probe.format?.bit_rate),
+        audioChannels: toNumberOrNull(audioStream.channels),
+        width: toNumberOrNull(videoStream.width),
+        height: toNumberOrNull(videoStream.height),
+      },
+    };
+  } finally {
+    if (require("fs").existsSync(tempFilePath)) {
+      require("fs").unlinkSync(tempFilePath);
+    }
+  }
 }
 
 async function getFfprobeMetadata(filePath) {
@@ -496,9 +520,7 @@ function emptyVideoMetadata() {
   };
 }
 
-function removeLocalFile(filePath) {
-  if (!filePath) return;
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
+function buildPublicId(originalName) {
+  const base = path.parse(originalName).name;
+  return `${Date.now()}-${base.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
 }
