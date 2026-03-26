@@ -208,25 +208,29 @@ app.post("/api/media/upload", upload.single("file"), async (req, res) => {
 
 app.get("/api/media", async (_req, res) => {
   try {
-    const result = await pool.query(
-      `
-        SELECT
-          media_id,
-          file_name,
-          file_path,
-          media_type,
-          capture_ts,
-          is_favourite
-        FROM media_items
-        ORDER BY capture_ts DESC NULLS LAST, ingested_at DESC
-      `
-    );
+    const result = await pool.query(`
+      SELECT
+        media_id,
+        file_name,
+        file_path,
+        media_type,
+        capture_ts,
+        is_favourite,
+        ingested_at
+      FROM media_items
+      WHERE file_path LIKE '/uploads/%'
+      ORDER BY ingested_at DESC
+    `);
 
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ message: "Failed to fetch media", error: error.message });
+    res.status(500).json({
+      message: "Failed to fetch media",
+      error: error.message
+    });
   }
 });
+
 
 app.get("/api/debug-db", async (_req, res) => {
   try {
