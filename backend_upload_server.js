@@ -242,6 +242,41 @@ app.get("/api/media", async (_req, res) => {
   }
 });
 
+app.patch("/api/media/:mediaId/favourite", async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { isFavourite } = req.body;
+
+    if (typeof isFavourite !== "boolean") {
+      return res.status(400).json({ message: "isFavourite must be boolean" });
+    }
+
+    const result = await pool.query(
+      `
+        UPDATE media_items
+        SET is_favourite = $1
+        WHERE media_id = $2
+        RETURNING media_id, is_favourite
+      `,
+      [isFavourite, mediaId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: "Media not found" });
+    }
+
+    res.json({
+      message: "Favourite updated",
+      media: result.rows[0],
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to update favourite",
+      error: error.message,
+    });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
